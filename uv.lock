@@ -853,7 +853,7 @@ wheels = [
 ]
 
 [[package]]
-name = "helioseismology"
+name = "helioseismic"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
