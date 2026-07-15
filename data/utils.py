@@ -475,11 +475,9 @@ def down_phi(ROOT, obstime, window=30*u.minute, product='phi-fdt-blos', level='L
         return None
     
 
-def down_aia_euv(ROOT, obstime, window=30*u.minute, wavelength=304):
+def down_aia_euv(ROOT_RAW, obstime, window=30*u.minute, wavelength=304):
     obstime_str = obstime.strftime('%Y%m%d_%H%M%S')
 
-    ROOT_RAW = ROOT / f'sdo_aia_{wavelength}'
-    ROOT_RAW.mkdir(parents=True, exist_ok=True)
     file = ROOT_RAW / f'{obstime_str}.fits'
 
     if file.exists():
