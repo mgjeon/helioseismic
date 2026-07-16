@@ -1,4 +1,22 @@
-"""Download matched SDO/AIA and STEREO/EUVI FITS observations."""
+"""
+Download matched SDO/AIA and STEREO/EUVI FITS observations.
+
+검증
+
+aia.lev1_euv_12s[2010.05.12_23:59:00-2010.05.13_00:01:00][171,193,304]{image}
+
+304
+20100513_001615_n4euA.fts
+20100512_235615_n4euB.fts
+
+193
+20100512_235530_n4euA.fts
+20100512_235530_n7euB.fts
+
+171
+20100513_001400_n4euA.fts
+20100513_001400_n4euB.fts
+"""
 
 import re
 from datetime import datetime, timedelta
@@ -109,7 +127,9 @@ def is_valid_fits(path):
 def download_file(url, path):
     """Download one URL to an exact path with parfive and one network retry."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    downloader = Downloader(max_conn=1, max_splits=1, overwrite=True)
+    downloader = Downloader(
+        max_conn=1, max_splits=1, progress=False, overwrite=True
+    )
     downloader.enqueue_file(url, path=path.parent, filename=path.name)
     result = downloader.download()
     if result.errors:
@@ -121,56 +141,64 @@ def download_file(url, path):
 def prepare_aia_fits(keywords, path):
     """Open a downloaded AIA segment and apply JSOC export header conventions."""
     hdus = fits.open(path, do_not_scale_image_data=True)
-    header = hdus[1].header
-    hdus[0].header["BITPIX"] = 8
+    try:
+        header = hdus[1].header
+        hdus[0].header["BITPIX"] = 8
 
-    for key, value in keywords.items():
-        if key in {"*recnum*", "T_REC_roun"} or SEGMENT_KEYWORD.match(key):
-            continue
-
-        if pd.isna(value):
-            if key in {"CRDER1", "CRDER2"}:
-                value = 0.0
-            elif key not in header and key not in BLANK_EXPORT_KEYS:
+        for key, value in keywords.items():
+            if key in {"*recnum*", "T_REC_roun"} or SEGMENT_KEYWORD.match(key):
                 continue
-            else:
-                header.pop(key, None)
+
+            if pd.isna(value):
+                if key in {"CRDER1", "CRDER2"}:
+                    value = 0.0
+                elif key not in header and key not in BLANK_EXPORT_KEYS:
+                    continue
+                else:
+                    if key in header:
+                        header.remove(key, remove_all=True)
+                    value = None
+            elif isinstance(value, str) and value.lower() in {"missing", "nan"}:
                 value = None
-        elif isinstance(value, str) and value.lower() in {"missing", "nan"}:
-            value = None
-        elif key.startswith("ROI_") and value == -(2**31):
-            value = None
+            elif key.startswith("ROI_") and value == -(2**31):
+                value = None
 
-        export_key = HEADER_ALIASES.get(key, key)
-        if export_key in {
-            "T_REC", "TRECEPOC", "T_OBS", "DATE-OBS", "DATE", "DATE_ME",
-            "DATE_S", "ISPPKTIM",
-        } and isinstance(value, str):
-            value = format_export_time(value)
+            export_key = HEADER_ALIASES.get(key, key)
+            if export_key in {
+                "T_REC", "TRECEPOC", "T_OBS", "DATE-OBS", "DATE", "DATE_ME",
+                "DATE_S", "ISPPKTIM",
+            } and isinstance(value, str):
+                value = format_export_time(value)
 
-        if export_key == "HISTORY":
-            if value is None:
+            if export_key == "HISTORY":
+                if value is None:
+                    continue
+                for line in value.splitlines():
+                    header.add_history(
+                        "".join(char for char in line if ord(char) >= 32)
+                    )
                 continue
-            for line in value.splitlines():
-                header.add_history("".join(char for char in line if ord(char) >= 32))
-            continue
-        if isinstance(value, str):
-            value = "".join(char for char in value if ord(char) >= 32)
-        try:
-            header[export_key] = value
-        except (TypeError, ValueError):
-            print(f"Skipped invalid FITS header: {export_key}={value!r}")
+            if isinstance(value, str):
+                value = "".join(char for char in value if ord(char) >= 32)
+            try:
+                header[export_key] = value
+            except (TypeError, ValueError):
+                tqdm.write(f"Skipped invalid FITS header: {export_key}={value!r}")
 
-    recnum = keywords.get("*recnum*")
-    if not pd.isna(recnum):
-        recnum = int(recnum)
-        header["DRMS_ID"] = f"aia.lev1_euv_12s:{recnum}:image"
-        header["PRIMARYK"] = "T_REC, WAVELNTH"
-        header["RECNUM"] = recnum
-        header["LONGSTRN"] = "OGIP 1.0"
+        recnum = keywords.get("*recnum*")
+        if not pd.isna(recnum):
+            recnum = int(recnum)
+            header["DRMS_ID"] = f"aia.lev1_euv_12s:{recnum}:image"
+            header["PRIMARYK"] = "T_REC, WAVELNTH"
+            header["RECNUM"] = recnum
+            header["LONGSTRN"] = "OGIP 1.0"
 
-    for stale_key in STALE_AIA_KEYS:
-        header.pop(stale_key, None)
+        for stale_key in STALE_AIA_KEYS:
+            if stale_key in header:
+                header.remove(stale_key, remove_all=True)
+    except Exception:
+        hdus.close()
+        raise
     return hdus
 
 
@@ -193,19 +221,19 @@ def download_stereo_euvi(url, path):
         except Exception as error:
             part.unlink(missing_ok=True)
             if attempt == RETRIES:
-                print(f"Failed: {path.name} ({error})")
+                tqdm.write(f"Failed: {path.name} ({error})")
                 return False
-            print(f"Retry {attempt}/{RETRIES}: {path.name} ({error})")
+            tqdm.write(f"Retry {attempt}/{RETRIES}: {path.name} ({error})")
             sleep(2 ** (attempt - 1))
 
 
 def download_sdo_aia(path, obstime, wavelength):
-    """Download the nearest QUALITY=0 AIA FITS observation within 30 minutes."""
+    """Download the nearest QUALITY=0 AIA FITS observation within 1 minute."""
     if is_valid_fits(path):
         return True
 
     path.unlink(missing_ok=True)
-    window = 30 * u.minute
+    window = 1 * u.minute
     time_range = (
         f"{(obstime - window).strftime('%Y.%m.%d_%H:%M:%S')}-"
         f"{(obstime + window).strftime('%Y.%m.%d_%H:%M:%S')}"
@@ -246,15 +274,25 @@ def download_sdo_aia(path, obstime, wavelength):
             path.unlink(missing_ok=True)
             path.with_suffix(".fits.part").unlink(missing_ok=True)
             if attempt == RETRIES:
-                print(f"Failed: AIA {wavelength} {path.name} ({error})")
+                tqdm.write(f"Failed: AIA {wavelength} {path.name} ({error})")
                 return False
-            print(f"Retry {attempt}/{RETRIES}: AIA {wavelength} {path.name} ({error})")
+            tqdm.write(
+                f"Retry {attempt}/{RETRIES}: AIA {wavelength} {path.name} ({error})"
+            )
             sleep(2 ** (attempt - 1))
 
 
 def main():
     """Download every matched triplet for each configured wavelength."""
+    match_tables = {}
     for stereo_wavelength in STEREO_WAVELENGTHS:
+        matches = pd.read_csv(MATCH_ROOT / f"matches_{stereo_wavelength}.csv")
+        match_tables[stereo_wavelength] = matches[matches["matched"]]
+
+    total_files = sum(len(matches) * 3 for matches in match_tables.values())
+    progress = tqdm(total=total_files, unit="file", dynamic_ncols=True)
+
+    for stereo_wavelength, matches in match_tables.items():
         wavelength_root = FITS_ROOT / str(stereo_wavelength)
         sdo_aia_dir = wavelength_root / "sdo_aia"
         sta_euvi_dir = wavelength_root / "sta_euvi"
@@ -262,38 +300,46 @@ def main():
         for directory in (sdo_aia_dir, sta_euvi_dir, stb_euvi_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        matches = pd.read_csv(MATCH_ROOT / f"matches_{stereo_wavelength}.csv")
-        matches = matches[matches["matched"]]
-
-        for row in tqdm(
-            matches.itertuples(index=False),
-            total=len(matches),
-            desc=str(stereo_wavelength),
-        ):
+        for row in matches.itertuples(index=False):
             sdo_time = Time(row.sdo_time)
             filename = sdo_time.strftime("%Y%m%d_%H%M%S.fits")
 
-            if not download_sdo_aia(
+            progress.set_description(f"{stereo_wavelength} Å | SDO/AIA")
+            progress.set_postfix_str(filename)
+            sdo_ok = download_sdo_aia(
                 sdo_aia_dir / filename,
                 sdo_time,
                 AIA_WAVELENGTH[stereo_wavelength],
-            ):
+            )
+            progress.update()
+            if not sdo_ok:
+                progress.update(2)
                 continue
 
+            progress.set_description(f"{stereo_wavelength} Å | STEREO-A/EUVI")
             sta_url = (
                 f"{STEREO_BASE_URL}/a/img/euvi/"
                 f"{pd.Timestamp(row.stereo_a_time):%Y/%m/%d}/"
                 f"{row.stereo_a_filename}"
             )
-            if not download_stereo_euvi(sta_url, sta_euvi_dir / filename):
+            sta_ok = download_stereo_euvi(sta_url, sta_euvi_dir / filename)
+            progress.update()
+            if not sta_ok:
+                progress.update()
                 continue
 
+            progress.set_description(f"{stereo_wavelength} Å | STEREO-B/EUVI")
             stb_url = (
                 f"{STEREO_BASE_URL}/b/img/euvi/"
                 f"{pd.Timestamp(row.stereo_b_time):%Y/%m/%d}/"
                 f"{row.stereo_b_filename}"
             )
             download_stereo_euvi(stb_url, stb_euvi_dir / filename)
+            progress.update()
+
+    progress.set_description("Complete")
+    progress.set_postfix_str("")
+    progress.close()
 
 
 if __name__ == "__main__":
