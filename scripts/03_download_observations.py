@@ -1,6 +1,8 @@
 """Download matched SDO/AIA and STEREO/EUVI FITS observations."""
 
 import re
+from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from time import sleep
 
@@ -45,6 +47,52 @@ STALE_AIA_KEYS = {
     "DATE_OBS", "DATE__OBS", "T_REC_epoch", "T_REC_step", "T_REC_unit",
     "T_REC_roun", "TRECROUN", "NOISEMASK", "BLD_VERS", "ROI_NWIN",
 }
+JSOC_TIME_PATTERN = re.compile(
+    r"^(?P<base>\d{4}(?:-\d{2}-\d{2}T|\.\d{2}\.\d{2}_)\d{2}:\d{2}:\d{2})"
+    r"(?:\.(?P<fraction>\d+))?(?P<suffix>Z|_TAI)?$"
+)
+
+
+def query_max_precision(client, *args, **kwargs):
+    """Run a DRMS query with JSOC's maximum-precision ``M=1`` flag."""
+    json_request = client._json._json_request
+
+    def max_precision_request(url):
+        """Append ``M=1`` to JSOC record-list requests."""
+        if url.startswith(client._server.url_jsoc_info) and "?op=rs_list" in url:
+            url += "&M=1"
+        return json_request(url)
+
+    client._json._json_request = max_precision_request
+    try:
+        return client.query(*args, **kwargs)
+    finally:
+        client._json._json_request = json_request
+
+
+def format_export_time(value):
+    """Round a maximum-precision JSOC timestamp to export milliseconds."""
+    match = JSOC_TIME_PATTERN.match(value)
+    if match is None:
+        return value
+
+    base = match.group("base")
+    fraction = match.group("fraction") or "0"
+    date_format = "%Y-%m-%dT%H:%M:%S" if "-" in base else "%Y.%m.%d_%H:%M:%S"
+    milliseconds = int(
+        (Decimal(f"0.{fraction}") * 1000).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+    )
+    timestamp = datetime.strptime(base, date_format) + timedelta(
+        milliseconds=milliseconds
+    )
+    suffix = "_TAI" if match.group("suffix") == "_TAI" else ""
+    return (
+        timestamp.strftime(date_format)
+        + f".{timestamp.microsecond // 1000:03d}"
+        + suffix
+    )
 
 
 def is_valid_fits(path):
@@ -94,12 +142,11 @@ def prepare_aia_fits(keywords, path):
             value = None
 
         export_key = HEADER_ALIASES.get(key, key)
-        if export_key in {"T_REC", "TRECEPOC"} and isinstance(value, str):
-            value = re.sub(r"(?<!\.\d{3})_TAI$", ".000_TAI", value)
-            if export_key == "T_REC":
-                value = re.sub(r"Z$", ".000", value)
-        elif export_key in {"T_OBS", "DATE-OBS"} and isinstance(value, str):
-            value = value.removesuffix("Z")
+        if export_key in {
+            "T_REC", "TRECEPOC", "T_OBS", "DATE-OBS", "DATE", "DATE_ME",
+            "DATE_S", "ISPPKTIM",
+        } and isinstance(value, str):
+            value = format_export_time(value)
 
         if export_key == "HISTORY":
             if value is None:
@@ -166,7 +213,9 @@ def download_sdo_aia(path, obstime, wavelength):
 
     for attempt in range(1, RETRIES + 1):
         try:
-            keys, segments = drms.Client().query(
+            client = drms.Client()
+            keys, segments = query_max_precision(
+                client,
                 f"aia.lev1_euv_12s[{time_range}][{wavelength}]",
                 key=JSOC_QUERY_KEYS,
                 seg="image",
