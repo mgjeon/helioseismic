@@ -38,7 +38,9 @@ def download_monthly_summaries():
 
     result = downloader.download()
     if result.errors:
-        raise RuntimeError(result.errors)
+        result = downloader.retry(result)
+    if result.errors:
+        raise RuntimeError(f"Failed to download STEREO summaries: {result.errors!r}")
 
 
 def build_stereo_catalogs():

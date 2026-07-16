@@ -43,7 +43,8 @@ uv run scripts/04_build_dataset_manifest.py
 
 1. 월별 STEREO summary를 내려받아 우주선별 카탈로그를 만든다.
 2. 12시간 간격의 SDO 기준 시각에서 30분 이내인 STEREO-A/B 관측을 찾는다.
-3. 매칭된 SDO/AIA와 STEREO/EUVI FITS를 내려받고 손상 여부를 검사한다.
+3. `parfive`로 SDO/AIA와 STEREO/EUVI FITS를 내려받고 손상 여부를 검사한다.
 4. 파일 경로, 관측 시각, 가용 여부와 시각 차이를 `dataset_manifest.csv`에 기록한다.
 
 STEREO 304/195/171 Å에는 각각 SDO/AIA 304/193/171 Å를 대응시킨다.
+SDO/AIA FITS 헤더는 JSOC export 규칙에 맞게 정규화한다.

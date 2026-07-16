@@ -1,14 +1,15 @@
 """Download matched SDO/AIA and STEREO/EUVI FITS observations."""
 
+import re
 from pathlib import Path
 from time import sleep
-from urllib.request import urlretrieve
 
 import astropy.units as u
 import drms
 import pandas as pd
 from astropy.io import fits
 from astropy.time import Time
+from parfive import Downloader
 from tqdm import tqdm
 
 
@@ -21,7 +22,29 @@ STEREO_BASE_URL = (
     "https://stereo-ssc.nascom.nasa.gov/data/ins_data/secchi/L0_YMD"
 )
 JSOC_BASE_URL = "http://jsoc.stanford.edu"
+JSOC_QUERY_KEYS = (
+    f"{drms.JsocInfoConstants.all.value},{drms.JsocInfoConstants.recnum.value}"
+)
 RETRIES = 5
+HEADER_ALIASES = {
+    "DATE__OBS": "DATE-OBS",
+    "T_REC_epoch": "TRECEPOC",
+    "T_REC_step": "TRECSTEP",
+    "T_REC_unit": "TRECUNIT",
+    "NOISEMASK": "NOISEMAS",
+}
+SEGMENT_KEYWORD = re.compile(
+    r"^(BUNIT|DATAKURT|DATAMAX|DATAMEAN|DATAMEDN|DATAMIN|DATARMS|"
+    r"DATASKEW|DATAVALS|MISSVALS)_\d{3}$"
+)
+BLANK_EXPORT_KEYS = {
+    "BKEYD1", "BKEYD2", "BKEYD3", "BKEYI1", "BKEYI2", "BKEYI3",
+    "CALVER32", "CSYSER1", "CSYSER2",
+}
+STALE_AIA_KEYS = {
+    "DATE_OBS", "DATE__OBS", "T_REC_epoch", "T_REC_step", "T_REC_unit",
+    "T_REC_roun", "TRECROUN", "NOISEMASK", "BLD_VERS", "ROI_NWIN",
+}
 
 
 def is_valid_fits(path):
@@ -35,6 +58,75 @@ def is_valid_fits(path):
         return False
 
 
+def download_file(url, path):
+    """Download one URL to an exact path with parfive and one network retry."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    downloader = Downloader(max_conn=1, max_splits=1, overwrite=True)
+    downloader.enqueue_file(url, path=path.parent, filename=path.name)
+    result = downloader.download()
+    if result.errors:
+        result = downloader.retry(result)
+    if result.errors or not path.is_file():
+        raise RuntimeError(f"Failed to download {url}: {result.errors!r}")
+
+
+def prepare_aia_fits(keywords, path):
+    """Open a downloaded AIA segment and apply JSOC export header conventions."""
+    hdus = fits.open(path, do_not_scale_image_data=True)
+    header = hdus[1].header
+    hdus[0].header["BITPIX"] = 8
+
+    for key, value in keywords.items():
+        if key in {"*recnum*", "T_REC_roun"} or SEGMENT_KEYWORD.match(key):
+            continue
+
+        if pd.isna(value):
+            if key in {"CRDER1", "CRDER2"}:
+                value = 0.0
+            elif key not in header and key not in BLANK_EXPORT_KEYS:
+                continue
+            else:
+                header.pop(key, None)
+                value = None
+        elif isinstance(value, str) and value.lower() in {"missing", "nan"}:
+            value = None
+        elif key.startswith("ROI_") and value == -(2**31):
+            value = None
+
+        export_key = HEADER_ALIASES.get(key, key)
+        if export_key in {"T_REC", "TRECEPOC"} and isinstance(value, str):
+            value = re.sub(r"(?<!\.\d{3})_TAI$", ".000_TAI", value)
+            if export_key == "T_REC":
+                value = re.sub(r"Z$", ".000", value)
+        elif export_key in {"T_OBS", "DATE-OBS"} and isinstance(value, str):
+            value = value.removesuffix("Z")
+
+        if export_key == "HISTORY":
+            if value is None:
+                continue
+            for line in value.splitlines():
+                header.add_history("".join(char for char in line if ord(char) >= 32))
+            continue
+        if isinstance(value, str):
+            value = "".join(char for char in value if ord(char) >= 32)
+        try:
+            header[export_key] = value
+        except (TypeError, ValueError):
+            print(f"Skipped invalid FITS header: {export_key}={value!r}")
+
+    recnum = keywords.get("*recnum*")
+    if not pd.isna(recnum):
+        recnum = int(recnum)
+        header["DRMS_ID"] = f"aia.lev1_euv_12s:{recnum}:image"
+        header["PRIMARYK"] = "T_REC, WAVELNTH"
+        header["RECNUM"] = recnum
+        header["LONGSTRN"] = "OGIP 1.0"
+
+    for stale_key in STALE_AIA_KEYS:
+        header.pop(stale_key, None)
+    return hdus
+
+
 def download_stereo_euvi(url, path):
     """Download and validate one EUVI FITS file, retrying transient failures."""
     if is_valid_fits(path):
@@ -46,7 +138,7 @@ def download_stereo_euvi(url, path):
     for attempt in range(1, RETRIES + 1):
         try:
             part.unlink(missing_ok=True)
-            urlretrieve(url, part)
+            download_file(url, part)
             if not is_valid_fits(part):
                 raise OSError("Downloaded FITS file is incomplete")
             part.replace(path)
@@ -76,7 +168,7 @@ def download_sdo_aia(path, obstime, wavelength):
         try:
             keys, segments = drms.Client().query(
                 f"aia.lev1_euv_12s[{time_range}][{wavelength}]",
-                key=drms.JsocInfoConstants.all,
+                key=JSOC_QUERY_KEYS,
                 seg="image",
             )
             quality_keys = keys[keys["QUALITY"] == 0]
@@ -88,26 +180,22 @@ def download_sdo_aia(path, obstime, wavelength):
                 scale="utc",
             )
             index = quality_keys.index[abs(times - obstime).argmin()]
-            header = keys.loc[index].to_dict()
+            keywords = keys.loc[index].to_dict()
             image_url = JSOC_BASE_URL + segments.loc[index, "image"]
+            part = path.with_suffix(".fits.part")
+            part.unlink(missing_ok=True)
+            download_file(image_url, part)
 
-            with fits.open(
-                image_url, cache=False, do_not_scale_image_data=True
-            ) as hdus:
-                for key, value in header.items():
-                    if pd.isna(value):
-                        continue
-                    try:
-                        hdus[1].header[key] = value
-                    except (TypeError, ValueError):
-                        pass
+            with prepare_aia_fits(keywords, part) as hdus:
                 hdus.writeto(path, overwrite=True, output_verify="silentfix")
+            part.unlink(missing_ok=True)
 
             if not is_valid_fits(path):
                 raise OSError("Downloaded FITS file is incomplete")
             return True
         except Exception as error:
             path.unlink(missing_ok=True)
+            path.with_suffix(".fits.part").unlink(missing_ok=True)
             if attempt == RETRIES:
                 print(f"Failed: AIA {wavelength} {path.name} ({error})")
                 return False
