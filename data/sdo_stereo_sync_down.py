@@ -26,7 +26,7 @@ def valid_fits(path):
 
 def download_stereo(url, path, retries=5):
     if valid_fits(path):
-        return
+        return True
     path.unlink(missing_ok=True)
     part = path.with_suffix(path.suffix + ".part")
 
@@ -37,11 +37,12 @@ def download_stereo(url, path, retries=5):
             if not valid_fits(part):
                 raise OSError("Downloaded FITS file is incomplete")
             part.replace(path)
-            return
+            return True
         except Exception as error:
             part.unlink(missing_ok=True)
             if attempt == retries - 1:
-                raise
+                print(f"Failed after {retries} attempts, skipping: {path.name} ({error})")
+                return False
             print(f"Retry {attempt + 1}/{retries}: {path.name} ({error})")
             sleep(2 ** attempt)
 
@@ -82,22 +83,24 @@ def main():
 
             if not download_sdo(sdo, Time(row.sdo_time), wavelength):
                 continue
-            download_stereo(
+            if not download_stereo(
                 _fits_url(
                     "STEREO-A",
                     pd.Timestamp(row.stereo_a_time),
                     row.stereo_a_filename,
                 ),
                 sta,
-            )
-            download_stereo(
+            ):
+                continue
+            if not download_stereo(
                 _fits_url(
                     "STEREO-B",
                     pd.Timestamp(row.stereo_b_time),
                     row.stereo_b_filename,
                 ),
                 stb,
-            )
+            ):
+                continue
 
 
 if __name__ == "__main__":
