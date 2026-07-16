@@ -356,8 +356,6 @@ def main():
             download_stereo_euvi(stb_url, stb_euvi_dir / filename)
             progress.update()
 
-            break
-
     progress.set_description("Complete")
     progress.set_postfix_str("")
     progress.close()
