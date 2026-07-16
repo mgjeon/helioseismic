@@ -1,21 +1,20 @@
 """
 Download matched SDO/AIA and STEREO/EUVI FITS observations.
 
+
 검증
 
 aia.lev1_euv_12s[2010.05.12_23:59:00-2010.05.13_00:01:00][171,193,304]{image}
 
-304
-20100513_001615_n4euA.fts
-20100512_235615_n4euB.fts
+sta
+304: 20100513_001615_n4euA.fts
+193: 20100512_235530_n4euA.fts
+171: 20100513_001400_n4euA.fts
 
-193
-20100512_235530_n4euA.fts
-20100512_235530_n7euB.fts
-
-171
-20100513_001400_n4euA.fts
-20100513_001400_n4euB.fts
+stb
+304: 20100512_235615_n4euB.fts
+193: 20100512_235530_n4euB.fts
+171: 20100513_001400_n4euB.fts
 """
 
 import re
@@ -124,6 +123,26 @@ def is_valid_fits(path):
         return False
 
 
+def is_quality_stereo_euvi(path):
+    """Return whether a STEREO FITS is readable, full-size, and has no gaps."""
+    try:
+        with fits.open(path, memmap=False) as hdus:
+            header = None
+            for hdu in hdus:
+                _ = hdu.data
+                if "NAXIS1" in hdu.header and "NMISSING" in hdu.header:
+                    header = hdu.header
+            if header is None:
+                return False
+            return (
+                header["NAXIS1"] >= 2048
+                and header["NAXIS2"] >= 2048
+                and header["NMISSING"] == 0
+            )
+    except Exception:
+        return False
+
+
 def download_file(url, path):
     """Download one URL to an exact path with parfive and one network retry."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -204,7 +223,7 @@ def prepare_aia_fits(keywords, path):
 
 def download_stereo_euvi(url, path):
     """Download and validate one EUVI FITS file, retrying transient failures."""
-    if is_valid_fits(path):
+    if is_quality_stereo_euvi(path):
         return True
 
     path.unlink(missing_ok=True)
@@ -214,8 +233,8 @@ def download_stereo_euvi(url, path):
         try:
             part.unlink(missing_ok=True)
             download_file(url, part)
-            if not is_valid_fits(part):
-                raise OSError("Downloaded FITS file is incomplete")
+            if not is_quality_stereo_euvi(part):
+                raise OSError("FITS is incomplete, undersized, or has missing blocks")
             part.replace(path)
             return True
         except Exception as error:
@@ -336,6 +355,8 @@ def main():
             )
             download_stereo_euvi(stb_url, stb_euvi_dir / filename)
             progress.update()
+
+            break
 
     progress.set_description("Complete")
     progress.set_postfix_str("")
